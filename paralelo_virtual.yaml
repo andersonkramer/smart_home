@@ -1,0 +1,219 @@
+blueprint:
+  name: "Paralelo Virtual Profissional - Múltiplos Interruptores"
+  description: >
+    Sincroniza bidirecionalmente um interruptor principal ligado fisicamente à carga
+    com um ou mais interruptores remotos sem carga. O último interruptor acionado
+    define o estado de todo o grupo. Utiliza comandos explícitos de ligar/desligar,
+    evita inversões causadas por toggle e sincroniza os remotos com o principal
+    após a inicialização do Home Assistant.
+
+    Requisitos:
+      - Todas as entidades devem pertencer ao domínio switch.
+      - O interruptor principal deve controlar fisicamente a carga.
+      - Os interruptores remotos devem estar alimentados, mas sem carga conectada.
+      - O LED de cada interruptor deve acompanhar o estado do próprio relé.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+
+  input:
+    configuracao:
+      name: Configuração dos interruptores
+      icon: mdi:electric-switch
+      description: Selecione o interruptor principal e todos os pontos remotos.
+      input:
+        interruptor_principal:
+          name: Interruptor principal
+          description: >
+            Entidade switch ligada fisicamente à lâmpada ou outra carga.
+            O estado desta entidade é usado como referência na inicialização.
+          selector:
+            entity:
+              filter:
+                - domain: switch
+              multiple: false
+
+        interruptores_remotos:
+          name: Interruptores remotos
+          description: >
+            Selecione todos os interruptores que funcionarão como paralelos virtuais.
+            É possível selecionar um ou vários interruptores.
+          selector:
+            entity:
+              filter:
+                - domain: switch
+              multiple: true
+
+    comportamento:
+      name: Comportamento
+      icon: mdi:cog-sync
+      collapsed: true
+      input:
+        sincronizar_ao_iniciar:
+          name: Sincronizar ao iniciar o Home Assistant
+          description: >
+            Quando habilitado, após a inicialização os interruptores remotos recebem
+            o estado atual do interruptor principal.
+          default: true
+          selector:
+            boolean:
+
+        atraso_inicializacao:
+          name: Atraso após inicialização
+          description: >
+            Tempo de espera para Zigbee2MQTT, MQTT e as entidades ficarem disponíveis
+            antes da sincronização inicial.
+          default:
+            seconds: 20
+          selector:
+            duration:
+              enable_day: false
+
+        ignorar_transicoes_indisponiveis:
+          name: Ignorar retorno de indisponibilidade
+          description: >
+            Quando habilitado, uma entidade que voltar de unavailable/unknown não
+            comandará todo o grupo. Isso evita acionamentos inesperados após falhas
+            ou reconexões Zigbee. A sincronização ocorrerá no próximo acionamento
+            físico ou na inicialização.
+          default: true
+          selector:
+            boolean:
+
+mode: queued
+max: 20
+max_exceeded: silent
+
+variables:
+  interruptor_principal: !input interruptor_principal
+  interruptores_remotos: !input interruptores_remotos
+  sincronizar_ao_iniciar: !input sincronizar_ao_iniciar
+  ignorar_transicoes_indisponiveis: !input ignorar_transicoes_indisponiveis
+  todos_interruptores: >
+    {{ ([interruptor_principal] + interruptores_remotos) | unique | list }}
+
+triggers:
+  - trigger: state
+    id: principal_ligado
+    entity_id: !input interruptor_principal
+    to: "on"
+
+  - trigger: state
+    id: principal_desligado
+    entity_id: !input interruptor_principal
+    to: "off"
+
+  - trigger: state
+    id: remoto_ligado
+    entity_id: !input interruptores_remotos
+    to: "on"
+
+  - trigger: state
+    id: remoto_desligado
+    entity_id: !input interruptores_remotos
+    to: "off"
+
+  - trigger: homeassistant
+    id: inicializacao
+    event: start
+
+conditions: []
+
+actions:
+  - choose:
+      # Sincronização após inicialização do Home Assistant.
+      - conditions:
+          - condition: trigger
+            id: inicializacao
+          - condition: template
+            value_template: "{{ sincronizar_ao_iniciar }}"
+        sequence:
+          - delay: !input atraso_inicializacao
+
+          - wait_template: >
+              {{ states(interruptor_principal) in ['on', 'off'] }}
+            timeout: "00:02:00"
+            continue_on_timeout: false
+
+          - variables:
+              estado_desejado: "{{ states(interruptor_principal) }}"
+              destinos: >
+                {% set ns = namespace(items=[]) %}
+                {% for entidade in interruptores_remotos %}
+                  {% if entidade != interruptor_principal
+                        and states(entidade) in ['on', 'off']
+                        and states(entidade) != estado_desejado %}
+                    {% set ns.items = ns.items + [entidade] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.items }}
+
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ estado_desejado == 'on' }}"
+                sequence:
+                  - action: homeassistant.turn_on
+                    target:
+                      entity_id: "{{ destinos }}"
+
+              - conditions:
+                  - condition: template
+                    value_template: "{{ estado_desejado == 'off' }}"
+                sequence:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: "{{ destinos }}"
+
+      # Mudança normal de qualquer interruptor do grupo.
+      - conditions:
+          - condition: trigger
+            id:
+              - principal_ligado
+              - principal_desligado
+              - remoto_ligado
+              - remoto_desligado
+
+          - condition: template
+            value_template: >
+              {{
+                not ignorar_transicoes_indisponiveis
+                or trigger.from_state is none
+                or trigger.from_state.state not in ['unknown', 'unavailable']
+              }}
+
+        sequence:
+          - variables:
+              estado_desejado: "{{ trigger.to_state.state }}"
+              origem: "{{ trigger.entity_id }}"
+              destinos: >
+                {% set ns = namespace(items=[]) %}
+                {% for entidade in todos_interruptores %}
+                  {% if entidade != origem
+                        and states(entidade) in ['on', 'off']
+                        and states(entidade) != estado_desejado %}
+                    {% set ns.items = ns.items + [entidade] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.items }}
+
+          # Só envia comando para entidades que realmente estejam divergentes.
+          - condition: template
+            value_template: "{{ destinos | count > 0 }}"
+
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ estado_desejado == 'on' }}"
+                sequence:
+                  - action: homeassistant.turn_on
+                    target:
+                      entity_id: "{{ destinos }}"
+
+              - conditions:
+                  - condition: template
+                    value_template: "{{ estado_desejado == 'off' }}"
+                sequence:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: "{{ destinos }}"
