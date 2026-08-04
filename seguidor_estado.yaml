@@ -1,0 +1,93 @@
+blueprint:
+  name: Seguidor de Estado (Mestre → Escravo)
+  description: >
+    Mantém uma entidade escrava sincronizada com uma entidade mestre.
+
+    Sempre que a entidade mestre mudar entre ON e OFF,
+    a entidade escrava será atualizada somente se necessário.
+
+  domain: automation
+
+  input:
+
+    master:
+
+      name: Entidade Mestre
+
+      selector:
+        entity: {}
+
+    slave:
+
+      name: Entidade Escrava
+
+      selector:
+        entity: {}
+
+mode: single
+
+trigger:
+
+  - platform: state
+    entity_id: !input master
+
+condition:
+
+  - condition: template
+    value_template: >
+
+      {{
+
+      trigger.to_state is not none
+
+      and
+
+      trigger.to_state.state in ['on','off']
+
+      }}
+
+action:
+
+  - choose:
+
+      - conditions:
+
+          - condition: state
+            entity_id: !input master
+            state: "on"
+
+          - condition: not
+            conditions:
+
+              - condition: state
+                entity_id: !input slave
+                state: "on"
+
+        sequence:
+
+          - service: homeassistant.turn_on
+
+            target:
+
+              entity_id: !input slave
+
+      - conditions:
+
+          - condition: state
+            entity_id: !input master
+            state: "off"
+
+          - condition: not
+            conditions:
+
+              - condition: state
+                entity_id: !input slave
+                state: "off"
+
+        sequence:
+
+          - service: homeassistant.turn_off
+
+            target:
+
+              entity_id: !input slave
